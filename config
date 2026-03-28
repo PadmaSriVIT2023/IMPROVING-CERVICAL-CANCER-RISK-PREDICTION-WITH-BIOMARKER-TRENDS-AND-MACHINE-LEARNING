@@ -1,0 +1,111 @@
+# PC-NSL Default Configuration
+# Author: Padmasri Sridharan
+
+# Data Configuration
+data:
+  clinical_path: "data/clinical/clinical_data.csv"
+  imaging_path: "data/imaging/segmentations/"
+  biomarker_path: "data/biomarkers/"
+  genomics_path: "data/genomics/mutations.csv"
+  labels_path: "data/labels/outcomes.csv"
+  train_split: 0.7
+  val_split: 0.15
+  test_split: 0.15
+  random_seed: 42
+  batch_size: 16
+  num_workers: 4
+
+# Model Configuration
+model:
+  # Variational Physics Encoder (VPE)
+  vpe:
+    clinical_dim: 156
+    imaging_dim: 128
+    latent_dim: 32
+    hidden_dims: [256, 128, 64]
+    dropout: 0.1
+    beta: 0.01
+  
+  # PDE Solver
+  pde_solver:
+    grid_size: 64
+    spatial_resolution: 0.5  # mm
+    n_steps: 24  # months
+    dt: 0.5  # days
+    adaptive_timestep: true
+  
+  # Dynamic Risk Operator (DRO)
+  dro:
+    d_model: 512
+    nhead: 8
+    num_layers: 4
+    dim_feedforward: 2048
+    dropout: 0.1
+  
+  # PDE Parameters
+  pde_params:
+    r_H: 0.2  # HPV intrinsic growth rate
+    H_max: 10000  # HPV carrying capacity
+    V_max: 1.0  # Tumor carrying capacity
+    beta_H: 0.3  # HPV to cytological abnormality rate
+    beta_I: 0.5  # Immune clearance rate of abnormal cells
+    delta_H: 0.05  # Natural HPV decay
+    delta_C: 0.02  # Spontaneous reversion rate
+    delta_V: 0.01  # Natural tumor cell death
+    delta_I: 0.05  # Immune cell turnover
+    lambda: 0.4  # Immune recruitment from cytological abnormality
+    mu: 0.3  # Immune recruitment from tumor
+
+# Training Configuration
+training:
+  epochs: 500
+  learning_rate: 0.0001
+  weight_decay: 0.00001
+  optimizer: "adamw"
+  scheduler:
+    type: "reduce_on_plateau"
+    patience: 20
+    factor: 0.5
+  early_stopping:
+    patience: 50
+    min_delta: 0.001
+  gradient_clip: 1.0
+  mixed_precision: true
+  device: "cuda"
+
+# Loss Weights
+loss_weights:
+  data: 1.0
+  physics: 1.0
+  aga: 1.0
+  kl: 0.01
+
+# Evaluation Configuration
+evaluation:
+  metrics: ["auc_roc", "average_precision", "f1", "balanced_accuracy", "ece"]
+  bootstrap_iterations: 1000
+  confidence_level: 0.95
+
+# Visualization Configuration
+visualization:
+  figure_format: "pdf"
+  dpi: 300
+  style: "publication"
+
+# Logging and Checkpoints
+logging:
+  log_dir: "results/logs"
+  checkpoint_dir: "results/checkpoints"
+  save_frequency: 10  # epochs
+  tensorboard: true
+  wandb:
+    enabled: false
+    project: "pc-nsl"
+    entity: null
+
+# Inference Configuration
+inference:
+  checkpoint: "results/checkpoints/best_model.pt"
+  output_dir: "results/predictions"
+  generate_simulations: true
+  uncertainty_quantification: true
