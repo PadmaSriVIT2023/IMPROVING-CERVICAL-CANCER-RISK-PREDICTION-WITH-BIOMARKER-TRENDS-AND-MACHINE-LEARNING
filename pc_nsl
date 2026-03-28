@@ -1,0 +1,275 @@
+"""
+PC-NSL: Physics-Constrained Neural Surrogate Learning
+Main model architecture combining VPE, PDE Solver, and DRO
+
+Author: Padmasri Sridharan
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Dict, List, Optional, Tuple, Union
+
+from models.vpe import VariationalPhysicsEncoder
+from models.pde_solver import DifferentiablePDESolver
+from models.dro import DynamicRiskOperator
+from models.losses import PhysicsLoss, AdjointGradientAlignmentLoss, KLDivergenceLoss
+
+
+class PCNSL(nn.Module):
+    """
+    Physics-Constrained Neural Surrogate Learning (PC-NSL) model.
+    
+    This model integrates biophysical PDEs as hard architectural constraints
+    within a deep neural network for cervical cancer prognosis.
+    
+    Args:
+        config (dict): Model configuration dictionary
+        device (torch.device): Device to run the model on
+    """
+    
+    def __init__(self, config: dict, device: torch.device = None):
+        super(PCNSL, self).__init__()
+        
+        self.config = config
+        self.device = device if device else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Initialize components
+        self.vpe = VariationalPhysicsEncoder(config['model']['vpe'])
+        self.pde_solver = DifferentiablePDESolver(config['model']['pde_solver'])
+        self.dro = DynamicRiskOperator(config['model']['dro'])
+        
+        # Initialize loss functions
+        self.physics_loss_fn = PhysicsLoss()
+        self.aga_loss_fn = AdjointGradientAlignmentLoss()
+        self.kl_loss_fn = KLDivergenceLoss()
+        
+        # Learnable loss weights (homoscedastic uncertainty)
+        self.log_sigma_sq = nn.Parameter(torch.zeros(4))
+        
+        # Move to device
+        self.to(self.device)
+    
+    def forward(
+        self,
+        clinical_features: torch.Tensor,
+        imaging_segmentation: torch.Tensor,
+        treatment_fields: Optional[torch.Tensor] = None,
+        return_latent: bool = False
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, dict]]:
+        """
+        Forward pass of PC-NSL.
+        
+        Args:
+            clinical_features: Clinical covariates [batch_size, clinical_dim]
+            imaging_segmentation: 3D imaging segmentation [batch_size, 1, 64, 64, 64]
+            treatment_fields: Treatment fields [batch_size, 4, 64, 64, n_steps]
+            return_latent: Whether to return latent representations
+        
+        Returns:
+            risk: Predicted risk scores [batch_size]
+            optional: Dictionary with latent representations and parameters
+        """
+        batch_size = clinical_features.shape[0]
+        
+        # Step 1: Encode to latent space and decode PDE parameters
+        z, mu, log_var = self.vpe.encode(clinical_features, imaging_segmentation)
+        pde_params, u0 = self.vpe.decode(z)
+        
+        # Step 2: Solve PDE forward in time
+        if treatment_fields is None:
+            treatment_fields = torch.zeros(
+                batch_size, 4, 64, 64, self.pde_solver.n_steps,
+                device=self.device
+            )
+        
+        u_t = self.pde_solver(u0, pde_params, treatment_fields)
+        
+        # Step 3: Map to risk prediction
+        risk = self.dro(u_t)
+        
+        if return_latent:
+            return risk, {
+                'z': z,
+                'mu': mu,
+                'log_var': log_var,
+                'pde_params': pde_params,
+                'u0': u0,
+                'u_t': u_t
+            }
+        
+        return risk
+    
+    def compute_loss(
+        self,
+        clinical_features: torch.Tensor,
+        imaging_segmentation: torch.Tensor,
+        treatment_fields: torch.Tensor,
+        labels: torch.Tensor,
+        return_components: bool = False
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, dict]]:
+        """
+        Compute multi-objective loss for training.
+        
+        Args:
+            clinical_features: Clinical covariates
+            imaging_segmentation: Imaging segmentations
+            treatment_fields: Treatment fields
+            labels: Binary labels (2-year PFS)
+            return_components: Whether to return individual loss components
+        
+        Returns:
+            total_loss: Combined loss
+            optional: Dictionary with individual loss components
+        """
+        # Forward pass with latent representations
+        risk, latent_dict = self.forward(
+            clinical_features,
+            imaging_segmentation,
+            treatment_fields,
+            return_latent=True
+        )
+        
+        # Data loss (binary cross-entropy)
+        data_loss = F.binary_cross_entropy(risk.squeeze(), labels)
+        
+        # Physics loss (PDE residual)
+        physics_loss = self.physics_loss_fn(
+            latent_dict['u_t'],
+            latent_dict['pde_params'],
+            treatment_fields
+        )
+        
+        # Adjoint gradient alignment loss
+        aga_loss = self.aga_loss_fn(
+            clinical_features,
+            imaging_segmentation,
+            labels,
+            self
+        )
+        
+        # KL divergence loss
+        kl_loss = self.kl_loss_fn(latent_dict['mu'], latent_dict['log_var'])
+        
+        # Learnable weights (homoscedastic uncertainty)
+        sigma_sq = torch.exp(self.log_sigma_sq)
+        total_loss = (
+            data_loss / (2 * sigma_sq[0]) +
+            physics_loss / (2 * sigma_sq[1]) +
+            aga_loss / (2 * sigma_sq[2]) +
+            kl_loss / (2 * sigma_sq[3]) +
+            0.5 * torch.sum(self.log_sigma_sq)
+        )
+        
+        if return_components:
+            components = {
+                'data_loss': data_loss.item(),
+                'physics_loss': physics_loss.item(),
+                'aga_loss': aga_loss.item(),
+                'kl_loss': kl_loss.item(),
+                'total_loss': total_loss.item(),
+                'sigma_1': sigma_sq[0].sqrt().item(),
+                'sigma_2': sigma_sq[1].sqrt().item(),
+                'sigma_3': sigma_sq[2].sqrt().item(),
+                'sigma_4': sigma_sq[3].sqrt().item()
+            }
+            return total_loss, components
+        
+        return total_loss
+    
+    def predict_with_uncertainty(
+        self,
+        clinical_features: torch.Tensor,
+        imaging_segmentation: torch.Tensor,
+        treatment_fields: Optional[torch.Tensor] = None,
+        n_samples: int = 100
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Predict with uncertainty quantification via Monte Carlo sampling.
+        
+        Args:
+            clinical_features: Clinical covariates
+            imaging_segmentation: Imaging segmentations
+            treatment_fields: Treatment fields
+            n_samples: Number of Monte Carlo samples
+        
+        Returns:
+            mean_risk: Mean predicted risk
+            std_risk: Standard deviation of predictions
+        """
+        self.train()  # Enable dropout for uncertainty
+        risks = []
+        
+        with torch.no_grad():
+            for _ in range(n_samples):
+                risk = self.forward(clinical_features, imaging_segmentation, treatment_fields)
+                risks.append(risk)
+        
+        risks = torch.stack(risks, dim=0)
+        mean_risk = risks.mean(dim=0)
+        std_risk = risks.std(dim=0)
+        
+        self.eval()
+        return mean_risk, std_risk
+    
+    def simulate_patient(
+        self,
+        clinical_features: torch.Tensor,
+        imaging_segmentation: torch.Tensor,
+        treatment_fields: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Generate full spatiotemporal simulation for a patient.
+        
+        Returns:
+            dict: Simulation results including tumor density, immune density,
+                  HPV load, and cytological abnormality over time
+        """
+        self.eval()
+        
+        with torch.no_grad():
+            z, mu, log_var = self.vpe.encode(clinical_features, imaging_segmentation)
+            pde_params, u0 = self.vpe.decode(z)
+            u_t = self.pde_solver(u0, pde_params, treatment_fields)
+        
+        return {
+            'tumor_density': u_t[:, 2, :, :, :],  # V(x,t)
+            'immune_density': u_t[:, 3, :, :, :],  # I(x,t)
+            'hpv_load': u_t[:, 0, :, :, :],       # H(x,t)
+            'cytological_abnormality': u_t[:, 1, :, :, :],  # C(x,t)
+            'pde_params': pde_params
+        }
+    
+    def get_subtype(self, clinical_features: torch.Tensor, imaging_segmentation: torch.Tensor) -> torch.Tensor:
+        """
+        Assign patient to subtype based on latent representation clustering.
+        
+        Returns:
+            subtype: Cluster assignment (0: Immune-Activated, 1: Immune-Excluded, 2: Rapid-Proliferator)
+        """
+        self.eval()
+        
+        with torch.no_grad():
+            z, mu, log_var = self.vpe.encode(clinical_features, imaging_segmentation)
+            pde_params, u0 = self.vpe.decode(z)
+        
+        # Extract key parameters for clustering
+        gamma = pde_params[:, 2]  # Immune activation rate
+        kappa = pde_params[:, 3]  # Tumor proliferation rate
+        alpha = pde_params[:, 0]  # HPV clearance rate
+        d_i = pde_params[:, 4]    # Immune diffusion coefficient
+        
+        # Simple decision tree based on parameter thresholds
+        subtype = torch.zeros_like(gamma, dtype=torch.long)
+        
+        # Rule-based classification (can be replaced with trained classifier)
+        high_immune = gamma > 0.07
+        low_immune = gamma < 0.05
+        high_proliferation = kappa > 0.22
+        low_diffusion = d_i < 0.012
+        
+        subtype[high_immune & (kappa < 0.18)] = 0  # Immune-Activated
+        subtype[low_diffusion & (gamma > 0.05)] = 1  # Immune-Excluded
+        subtype[high_proliferation | low_immune] = 2  # Rapid-Proliferator
+        
+        return subtype
