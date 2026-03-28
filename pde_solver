@@ -1,0 +1,128 @@
+"""
+Differentiable PDE Solver for Tumor-Immune-Viral Dynamics
+Implements reaction-diffusion system with analytical gradients
+
+Author: Padmasri Sridharan
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Tuple, Optional
+
+
+class DifferentiablePDESolver(nn.Module):
+    """
+    Differentiable PDE Solver for the reaction-diffusion system.
+    
+    Solves:
+    ∂u/∂t = D∇²u + R(u; p) + S(x,t)
+    
+    where u = [H, C, V, I] representing:
+    - H: HPV viral load
+    - C: Cytological abnormality score
+    - V: Tumor cell density
+    - I: Immune cell density
+    
+    Args:
+        config (dict): Configuration dictionary with PDE solver parameters
+    """
+    
+    def __init__(self, config: dict):
+        super(DifferentiablePDESolver, self).__init__()
+        
+        self.grid_size = config.get('grid_size', 64)
+        self.dx = config.get('spatial_resolution', 0.5)  # mm
+        self.n_steps = config.get('n_steps', 24)  # months
+        self.dt = config.get('dt', 0.5)  # days
+        self.adaptive_timestep = config.get('adaptive_timestep', True)
+        
+        # Laplacian kernel (5-point stencil)
+        self.register_buffer(
+            'laplacian_kernel',
+            torch.tensor([[[[0, 1, 0], [1, -4, 1], [0, 1, 0]]]], dtype=torch.float32) / (self.dx ** 2)
+        )
+    
+    def forward(
+        self,
+        u0: torch.Tensor,
+        pde_params: torch.Tensor,
+        treatment_fields: Optional[torch.Tensor] = None,
+        return_all_steps: bool = True
+    ) -> torch.Tensor:
+        """
+        Solve PDE forward in time using 4th-order Runge-Kutta (RK4).
+        
+        Args:
+            u0: Initial conditions [batch_size, 4, grid_size, grid_size]
+            pde_params: PDE parameters [batch_size, 8]
+            treatment_fields: Time-varying treatment fields [batch_size, 4, grid_size, grid_size, n_steps]
+            return_all_steps: Return all time steps or only final state
+        
+        Returns:
+            u_t: Solution at all time steps [batch_size, 4, grid_size, grid_size, n_steps]
+                 or final state only [batch_size, 4, grid_size, grid_size]
+        """
+        batch_size = u0.shape[0]
+        u = u0.clone()
+        
+        if treatment_fields is None:
+            treatment_fields = torch.zeros(
+                batch_size, 4, self.grid_size, self.grid_size, self.n_steps,
+                device=u0.device
+            )
+        
+        # Storage for all time steps
+        if return_all_steps:
+            u_all = torch.zeros(
+                batch_size, 4, self.grid_size, self.grid_size, self.n_steps,
+                device=u0.device
+            )
+        
+        for t_idx in range(self.n_steps):
+            # Get treatment at current time
+            treatment = treatment_fields[..., t_idx]
+            
+            # RK4 integration
+            k1 = self._compute_dudt(u, pde_params, treatment)
+            k2 = self._compute_dudt(u + 0.5 * self.dt * k1, pde_params, treatment)
+            k3 = self._compute_dudt(u + 0.5 * self.dt * k2, pde_params, treatment)
+            k4 = self._compute_dudt(u + self.dt * k3, pde_params, treatment)
+            
+            u = u + (self.dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+            
+            if return_all_steps:
+                u_all[..., t_idx] = u
+        
+        if return_all_steps:
+            return u_all
+        return u
+    
+    def _compute_dudt(
+        self,
+        u: torch.Tensor,
+        pde_params: torch.Tensor,
+        treatment: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute ∂u/∂t = D∇²u + R(u; p) + S(x,t).
+        
+        Args:
+            u: State variables [batch_size, 4, grid_size, grid_size]
+            pde_params: PDE parameters [batch_size, 8]
+            treatment: Treatment effects at current time [batch_size, 4, grid_size, grid_size]
+        
+        Returns:
+            dudt: Time derivative [batch_size, 4, grid_size, grid_size]
+        """
+        batch_size = u.shape[0]
+        dudt = torch.zeros_like(u)
+        
+        # Extract state variables
+        H = u[:, 0:1, :, :]  # HPV viral load
+        C = u[:, 1:2, :, :]  # Cytological abnormality
+        V = u[:, 2:3, :, :]  # Tumor cell density
+        I = u[:, 3:4, :, :]  # Immune cell density
+        
+        # Extract PDE parameters
+        alpha = pde
