@@ -1,0 +1,171 @@
+"""
+Training script for PC-NSL model
+
+Usage:
+    python train.py --config config/default_config.yaml
+    python train.py --resume results/checkpoints/checkpoint_epoch_300.pt
+
+Author: Padmasri Sridharan
+"""
+
+import os
+import sys
+import argparse
+import yaml
+import logging
+import json
+from datetime import datetime
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+
+# Add project root to path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from data.dataset import CervicalCancerDataset
+from models.pc_nsl import PCNSL
+from training.trainer import Trainer
+from training.optimizer import get_optimizer, get_scheduler
+from utils.logger import setup_logger
+from utils.checkpoint import save_checkpoint, load_checkpoint
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Train PC-NSL model')
+    parser.add_argument('--config', type=str, default='config/default_config.yaml',
+                        help='Path to configuration file')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to checkpoint to resume from')
+    parser.add_argument('--batch_size', type=int, default=None,
+                        help='Batch size (overrides config)')
+    parser.add_argument('--learning_rate', type=float, default=None,
+                        help='Learning rate (overrides config)')
+    parser.add_argument('--epochs', type=int, default=None,
+                        help='Number of epochs (overrides config)')
+    parser.add_argument('--device', type=str, default=None,
+                        help='Device to use (cuda/cpu)')
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    
+    # Load configuration
+    with open(args.config, 'r') as f:
+        config = yaml.safe_load(f)
+    
+    # Override config with command line arguments
+    if args.batch_size:
+        config['data']['batch_size'] = args.batch_size
+    if args.learning_rate:
+        config['training']['learning_rate'] = args.learning_rate
+    if args.epochs:
+        config['training']['epochs'] = args.epochs
+    if args.device:
+        config['training']['device'] = args.device
+    
+    # Setup logging
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_dir = Path(config['logging']['log_dir']) / timestamp
+    log_dir.mkdir(parents=True, exist_ok=True)
+    
+    logger = setup_logger(log_dir / 'train.log')
+    logger.info(f'Configuration: {json.dumps(config, indent=2)}')
+    
+    # Set device
+    device = torch.device(config['training']['device'] if torch.cuda.is_available() else 'cpu')
+    logger.info(f'Using device: {device}')
+    
+    # Create datasets and dataloaders
+    logger.info('Loading datasets...')
+    
+    train_dataset = CervicalCancerDataset(
+        config['data']['clinical_path'],
+        config['data']['imaging_path'],
+        config['data']['biomarker_path'],
+        config['data']['genomics_path'],
+        config['data']['labels_path'],
+        split='train',
+        split_ratio=(config['data']['train_split'], config['data']['val_split'], config['data']['test_split']),
+        random_seed=config['data']['random_seed']
+    )
+    
+    val_dataset = CervicalCancerDataset(
+        config['data']['clinical_path'],
+        config['data']['imaging_path'],
+        config['data']['biomarker_path'],
+        config['data']['genomics_path'],
+        config['data']['labels_path'],
+        split='val',
+        split_ratio=(config['data']['train_split'], config['data']['val_split'], config['data']['test_split']),
+        random_seed=config['data']['random_seed']
+    )
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config['data']['batch_size'],
+        shuffle=True,
+        num_workers=config['data']['num_workers'],
+        pin_memory=True
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config['data']['batch_size'],
+        shuffle=False,
+        num_workers=config['data']['num_workers'],
+        pin_memory=True
+    )
+    
+    logger.info(f'Training samples: {len(train_dataset)}')
+    logger.info(f'Validation samples: {len(val_dataset)}')
+    
+    # Create model
+    logger.info('Creating model...')
+    model = PCNSL(config, device)
+    logger.info(f'Model parameters: {sum(p.numel() for p in model.parameters()):,}')
+    
+    # Create optimizer and scheduler
+    optimizer = get_optimizer(model, config['training'])
+    scheduler = get_scheduler(optimizer, config['training'])
+    
+    # Create trainer
+    trainer = Trainer(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        config=config,
+        device=device,
+        log_dir=log_dir,
+        logger=logger
+    )
+    
+    # Resume from checkpoint if specified
+    start_epoch = 0
+    best_auc = 0.0
+    
+    if args.resume:
+        logger.info(f'Resuming from checkpoint: {args.resume}')
+        checkpoint = load_checkpoint(args.resume)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        best_auc = checkpoint.get('best_auc', 0.0)
+        logger.info(f'Resumed from epoch {start_epoch}, best AUC: {best_auc:.4f}')
+    
+    # Train
+    logger.info('Starting training...')
+    trainer.train(start_epoch, best_auc)
+    
+    logger.info('Training completed!')
+
+
+if __name__ == '__main__':
+    main()
