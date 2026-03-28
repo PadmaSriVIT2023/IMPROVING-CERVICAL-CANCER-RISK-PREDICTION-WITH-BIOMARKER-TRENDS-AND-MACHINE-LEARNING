@@ -1,0 +1,8 @@
+# Train from scratch
+python scripts/train.py --config config/default_config.yaml
+
+# Resume training from checkpoint
+python scripts/train.py --resume results/checkpoints/checkpoint_epoch_300.pt
+
+# Train with custom hyperparameters
+python scripts/train.py --batch_size 16 --learning_rate 1e-4 --epochs 500
