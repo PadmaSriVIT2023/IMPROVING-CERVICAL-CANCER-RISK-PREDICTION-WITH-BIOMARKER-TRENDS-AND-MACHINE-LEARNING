@@ -1,0 +1,140 @@
+"""
+Dynamic Risk Operator (DRO)
+Transformer-based risk prediction from simulated spatiotemporal dynamics
+
+Author: Padmasri Sridharan
+Date: 2026
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+
+class PositionalEncoding(nn.Module):
+    """
+    Positional encoding for temporal information.
+    """
+    
+    def __init__(self, d_model: int, max_len: int = 100):
+        super(PositionalEncoding, self).__init__()
+        
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        
+        self.register_buffer('pe', pe)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.pe[:, :x.size(1), :]
+
+
+class DynamicRiskOperator(nn.Module):
+    """
+    Dynamic Risk Operator (DRO) for PC-NSL.
+    
+    Processes simulated spatiotemporal dynamics through a Transformer encoder
+    to predict 2-year progression-free survival risk.
+    
+    Args:
+        config (dict): Configuration dictionary with DRO parameters
+    """
+    
+    def __init__(self, config: dict):
+        super(DynamicRiskOperator, self).__init__()
+        
+        self.d_model = config.get('d_model', 512)
+        self.nhead = config.get('nhead', 8)
+        self.num_layers = config.get('num_layers', 4)
+        self.dim_feedforward = config.get('dim_feedforward', 2048)
+        self.dropout = config.get('dropout', 0.1)
+        self.n_steps = config.get('n_steps', 24)
+        
+        # Projection from spatial grid to d_model
+        self.spatial_projection = nn.Linear(4 * 64 * 64, self.d_model)
+        
+        # Positional encoding for temporal information
+        self.pos_encoder = PositionalEncoding(self.d_model, self.n_steps)
+        
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.d_model,
+            nhead=self.nhead,
+            dim_feedforward=self.dim_feedforward,
+            dropout=self.dropout,
+            activation='gelu',
+            batch_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, self.num_layers)
+        
+        # [CLS] token
+        self.cls_token = nn.Parameter(torch.randn(1, 1, self.d_model))
+        
+        # Risk prediction head
+        self.risk_head = nn.Sequential(
+            nn.Linear(self.d_model, 256),
+            nn.GELU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(256, 64),
+            nn.GELU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(64, 1),
+            nn.Sigmoid()
+        )
+        
+        # Layer normalization
+        self.layer_norm = nn.LayerNorm(self.d_model)
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize weights using Xavier uniform initialization."""
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+    
+    def forward(self, u_t: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of DRO.
+        
+        Args:
+            u_t: Simulated spatiotemporal dynamics [batch_size, 4, grid_size, grid_size, n_steps]
+        
+        Returns:
+            risk: Predicted risk scores [batch_size]
+        """
+        batch_size = u_t.shape[0]
+        
+        # Reshape spatial dimensions to a single vector
+        # u_t: [B, 4, H, W, T] -> [B, T, 4*H*W]
+        spatial_features = u_t.permute(0, 4, 1, 2, 3).contiguous()
+        spatial_features = spatial_features.view(batch_size, self.n_steps, -1)
+        
+        # Project to d_model
+        token_embeddings = self.spatial_projection(spatial_features)
+        
+        # Add positional encoding
+        token_embeddings = self.pos_encoder(token_embeddings)
+        
+        # Add [CLS] token
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        token_embeddings = torch.cat([cls_tokens, token_embeddings], dim=1)
+        
+        # Apply layer normalization
+        token_embeddings = self.layer_norm(token_embeddings)
+        
+        # Transformer encoder
+        encoded = self.transformer_encoder(token_embeddings)
+        
+        # Extract [CLS] token representation
+        cls_representation = encoded[:, 0, :]
+        
+        # Predict risk
+        risk = self.risk_head(cls_representation)
+        
+        return risk.squeeze(-1)
