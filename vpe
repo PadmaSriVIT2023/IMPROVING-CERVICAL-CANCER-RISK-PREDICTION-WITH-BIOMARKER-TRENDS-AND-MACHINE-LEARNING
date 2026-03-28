@@ -1,0 +1,152 @@
+"""
+Variational Physics Encoder (VPE)
+Infers patient-specific PDE parameters and initial conditions from static clinical data
+
+Author: Padmasri Sridharan
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Tuple
+
+
+class VariationalPhysicsEncoder(nn.Module):
+    """
+    Variational Physics Encoder (VPE) for PC-NSL.
+    
+    Maps static clinical data to a latent space encoding patient-specific
+    biophysical parameters with probabilistic formulation.
+    
+    Args:
+        config (dict): Configuration dictionary with VPE parameters
+    """
+    
+    def __init__(self, config: dict):
+        super(VariationalPhysicsEncoder, self).__init__()
+        
+        self.clinical_dim = config.get('clinical_dim', 156)
+        self.imaging_dim = config.get('imaging_dim', 128)
+        self.latent_dim = config.get('latent_dim', 32)
+        self.hidden_dims = config.get('hidden_dims', [256, 128, 64])
+        self.dropout_rate = config.get('dropout', 0.1)
+        self.beta = config.get('beta', 0.01)
+        
+        # Clinical MLP encoder
+        clinical_layers = []
+        in_dim = self.clinical_dim
+        for h_dim in self.hidden_dims:
+            clinical_layers.append(nn.Linear(in_dim, h_dim))
+            clinical_layers.append(nn.ReLU())
+            clinical_layers.append(nn.Dropout(self.dropout_rate))
+            in_dim = h_dim
+        self.clinical_encoder = nn.Sequential(*clinical_layers)
+        
+        # 3D CNN for imaging segmentation
+        self.imaging_encoder = nn.Sequential(
+            nn.Conv3d(1, 32, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv3d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv3d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool3d(1)
+        )
+        
+        # Fusion layer
+        fusion_dim = self.hidden_dims[-1] + 128
+        self.fusion = nn.Sequential(
+            nn.Linear(fusion_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU()
+        )
+        
+        # Latent space parameters
+        self.fc_mu = nn.Linear(128, self.latent_dim)
+        self.fc_log_var = nn.Linear(128, self.latent_dim)
+        
+        # Decoders
+        self.pde_param_decoder = nn.Sequential(
+            nn.Linear(self.latent_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 8)  # 8 PDE parameters
+        )
+        
+        self.initial_condition_decoder = nn.Sequential(
+            nn.Linear(self.latent_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 512),
+            nn.ReLU(),
+            nn.Linear(512, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 4 * 64 * 64)  # 4 state variables × 64×64 grid
+        )
+    
+    def encode(
+        self,
+        clinical_features: torch.Tensor,
+        imaging_segmentation: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Encode input to latent distribution parameters.
+        
+        Args:
+            clinical_features: Clinical covariates [batch_size, clinical_dim]
+            imaging_segmentation: 3D imaging segmentation [batch_size, 1, 64, 64, 64]
+        
+        Returns:
+            z: Sampled latent vector [batch_size, latent_dim]
+            mu: Mean of latent distribution [batch_size, latent_dim]
+            log_var: Log variance of latent distribution [batch_size, latent_dim]
+        """
+        # Encode clinical features
+        clinical_embedding = self.clinical_encoder(clinical_features)
+        
+        # Encode imaging segmentation
+        imaging_embedding = self.imaging_encoder(imaging_segmentation).squeeze(-1).squeeze(-1).squeeze(-1)
+        
+        # Fuse embeddings
+        fused = torch.cat([clinical_embedding, imaging_embedding], dim=-1)
+        fused = self.fusion(fused)
+        
+        # Latent distribution parameters
+        mu = self.fc_mu(fused)
+        log_var = self.fc_log_var(fused)
+        
+        # Reparameterization trick
+        std = torch.exp(0.5 * log_var)
+        eps = torch.randn_like(std)
+        z = mu + eps * std
+        
+        return z, mu, log_var
+    
+    def decode(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Decode latent vector to PDE parameters and initial conditions.
+        
+        Args:
+            z: Latent vector [batch_size, latent_dim]
+        
+        Returns:
+            pde_params: PDE parameters [batch_size, 8]
+            u0: Initial conditions [batch_size, 4, 64, 64]
+        """
+        pde_params = self.pde_param_decoder(z)
+        u0_flat = self.initial_condition_decoder(z)
+        u0 = u0_flat.view(-1, 4, 64, 64)
+        
+        # Apply sigmoid to enforce physical bounds
+        pde_params = torch.sigmoid(pde_params)
+        
+        # Scale to realistic ranges
+        pde_params = pde_params * torch.tensor(
+            [0.5, 1.0, 0.3, 0.5, 0.05, 0.1, 0.5, 0.5],
+            device=z.device
+        )
+        
+        return pde_params, u0
