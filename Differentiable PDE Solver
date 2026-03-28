@@ -1,0 +1,7 @@
+from models.pde_solver import DifferentiablePDESolver
+
+solver = DifferentiablePDESolver(
+    grid_size=64,
+    dt=0.5,
+    n_steps=24
+)
