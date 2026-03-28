@@ -125,4 +125,56 @@ class DifferentiablePDESolver(nn.Module):
         I = u[:, 3:4, :, :]  # Immune cell density
         
         # Extract PDE parameters
-        alpha = pde
+        alpha = pde_params[:, 0:1].unsqueeze(-1).unsqueeze(-1)  # HPV clearance rate
+        beta_H = pde_params[:, 1:2].unsqueeze(-1).unsqueeze(-1)  # HPV to cytological rate
+        beta_I = pde_params[:, 2:3].unsqueeze(-1).unsqueeze(-1)  # Immune clearance of abnormal cells
+        gamma = pde_params[:, 3:4].unsqueeze(-1).unsqueeze(-1)  # Immune-mediated killing
+        kappa = pde_params[:, 4:5].unsqueeze(-1).unsqueeze(-1)  # Tumor proliferation
+        delta_V = pde_params[:, 5:6].unsqueeze(-1).unsqueeze(-1)  # Natural tumor death
+        lambda_param = pde_params[:, 6:7].unsqueeze(-1).unsqueeze(-1)  # Immune recruitment from C
+        mu = pde_params[:, 7:8].unsqueeze(-1).unsqueeze(-1)  # Immune recruitment from V
+        
+        # Diffusion coefficients
+        D_H = 0.01  # HPV diffusion
+        D_C = 0.02  # Cytological abnormality diffusion
+        D_V = 0.005  # Tumor diffusion
+        D_I = 0.015  # Immune diffusion
+        
+        # Laplacian (diffusion)
+        laplacian = F.conv2d(u.view(-1, 1, self.grid_size, self.grid_size), self.laplacian_kernel, padding=1)
+        laplacian = laplacian.view(batch_size, 4, self.grid_size, self.grid_size)
+        
+        # HPV dynamics (Equation 2)
+        H_max = 10000.0
+        r_H = 0.2
+        growth_H = r_H * H * (1 - H / H_max)
+        immune_clearance_H = alpha * H * I
+        decay_H = 0.05 * H
+        dHdt = D_H * laplacian[:, 0:1, :, :] + growth_H - immune_clearance_H - decay_H + treatment[:, 0:1, :, :]
+        
+        # Cytological abnormality dynamics (Equation 3)
+        progression = beta_H * H * (1 - C)
+        immune_clearance_C = beta_I * I * C
+        reversion = 0.02 * C
+        dCdt = D_C * laplacian[:, 1:2, :, :] + progression - immune_clearance_C - reversion + treatment[:, 1:2, :, :]
+        
+        # Tumor cell density dynamics (Equation 4)
+        V_max = 1.0
+        growth_V = kappa * V * (1 - V / V_max)
+        immune_killing = gamma * I * V
+        death_V = delta_V * V
+        dVdt = D_V * laplacian[:, 2:3, :, :] + growth_V - immune_killing - death_V + treatment[:, 2:3, :, :]
+        
+        # Immune cell density dynamics (Equation 5)
+        recruitment_C = lambda_param * C
+        recruitment_V = mu * V
+        turnover_I = 0.05 * I
+        dIdt = D_I * laplacian[:, 3:4, :, :] + recruitment_C + recruitment_V - turnover_I + treatment[:, 3:4, :, :]
+        
+        # Assemble
+        dudt = torch.cat([dHdt, dCdt, dVdt, dIdt], dim=1)
+        
+        # Apply non-negativity constraint
+        dudt = torch.clamp(dudt, min=-1e6)
+        
+        return dudt
