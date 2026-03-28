@@ -1,0 +1,8 @@
+# Evaluate on test set
+python scripts/evaluate.py --checkpoint results/checkpoints/best_model.pt
+
+# Generate predictions for new patients
+python scripts/predict.py --checkpoint results/checkpoints/best_model.pt --data_path data/new_patients/
+
+# Generate spatiotemporal simulations
+python scripts/generate_simulations.py --checkpoint results/checkpoints/best_model.pt --patient_id P001
